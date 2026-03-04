@@ -19,6 +19,7 @@ import (
 	dscv2 "github.com/opendatahub-io/opendatahub-operator/v2/api/datasciencecluster/v2"
 	serviceApi "github.com/opendatahub-io/opendatahub-operator/v2/api/services/v1alpha1"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
+	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/metadata/annotations"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/resources"
 )
 
@@ -36,6 +37,7 @@ type DeploymentPredicate struct {
 
 // Update implements default UpdateEvent filter for validating generation change.
 // Works with both typed *appsv1.Deployment and *unstructured.Unstructured objects.
+// Also triggers reconciliation when the opendatahub.io/managed annotation changes.
 func (DeploymentPredicate) Update(e event.UpdateEvent) bool {
 	if e.ObjectOld == nil || e.ObjectNew == nil {
 		return false
@@ -48,9 +50,14 @@ func (DeploymentPredicate) Update(e event.UpdateEvent) bool {
 		return false
 	}
 
+	// Check if the opendatahub.io/managed annotation changed
+	oldManaged := resources.GetAnnotation(e.ObjectOld, annotations.ManagedByODHOperator)
+	newManaged := resources.GetAnnotation(e.ObjectNew, annotations.ManagedByODHOperator)
+
 	return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
 		oldReplicas != newReplicas ||
-		oldReadyReplicas != newReadyReplicas
+		oldReadyReplicas != newReadyReplicas ||
+		oldManaged != newManaged
 }
 
 // getDeploymentStatus extracts replicas and readyReplicas from a Deployment object.

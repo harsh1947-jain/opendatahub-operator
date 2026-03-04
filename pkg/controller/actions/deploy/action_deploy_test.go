@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	apimachinery "k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -102,6 +103,106 @@ func TestDeployAction(t *testing.T) {
 		jq.Match(`.metadata.annotations."%s" == "%s"`, annotations.PlatformVersion, "1.2.3"),
 		jq.Match(`.metadata.annotations."%s" == "%s"`, annotations.PlatformType, string(cluster.OpenDataHub)),
 	))
+
+	//
+	// Test managed annotation behavior
+	//
+	// NOTE: FakeClient does not support Strategic Merge Patch execution, so the actual
+	// resource removal cannot be fully validated in this unit test. The logic in
+	// action_deploy.go (lines 447-513) uses Strategic Merge Patch to remove container
+	// resources when managed=true, but FakeClient accepts the patch without executing it.
+	// This test verifies:
+	// 1. The managed annotation is properly handled
+	// 2. The action doesn't error when managed annotation is set
+	// 3. The deployment is updated with the annotation
+	// Full validation of resource removal requires manual testing or EnvTest integration tests.
+	//
+
+	deployName := xid.New().String()
+	obj2, err := resources.ToUnstructured(&appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: appsv1.SchemeGroupVersion.String(),
+			Kind:       "Deployment",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      deployName,
+			Namespace: ns,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To(int32(3)),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "test"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "test"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "test-container",
+							Image: "test:latest",
+							// No resources specified in manifest
+						},
+					},
+				},
+			},
+		},
+	})
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	// Create deployment without managed annotation
+	rr.Resources = []unstructured.Unstructured{*obj2}
+	err = action(ctx, &rr)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	// Verify deployment was created
+	err = cl.Get(ctx, client.ObjectKey{Namespace: ns, Name: deployName}, obj2)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	// Simulate user adding container resources via kubectl patch
+	// This mimics: kubectl patch deployment test --patch '{"spec":{"template":{"spec":{"containers":[{"name":"test-container","resources":{"limits":{"cpu":"200m"}}}]}}}}'
+	containers, found, err := unstructured.NestedSlice(obj2.Object, "spec", "template", "spec", "containers")
+	g.Expect(err).ShouldNot(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(containers).To(HaveLen(1))
+
+	container := containers[0].(map[string]interface{})
+	err = unstructured.SetNestedField(container, "200m", "resources", "limits", "cpu")
+	g.Expect(err).ShouldNot(HaveOccurred())
+	containers[0] = container
+
+	err = unstructured.SetNestedSlice(obj2.Object, containers, "spec", "template", "spec", "containers")
+	g.Expect(err).ShouldNot(HaveOccurred())
+	err = cl.Update(ctx, obj2)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	// Verify resources were added
+	err = cl.Get(ctx, client.ObjectKey{Namespace: ns, Name: deployName}, obj2)
+	g.Expect(err).ShouldNot(HaveOccurred())
+	containers, found, err = unstructured.NestedSlice(obj2.Object, "spec", "template", "spec", "containers")
+	g.Expect(err).ShouldNot(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	container = containers[0].(map[string]interface{})
+	cpu, found, err := unstructured.NestedString(container, "resources", "limits", "cpu")
+	g.Expect(err).ShouldNot(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(cpu).To(Equal("200m"))
+
+	// Now add managed annotation and re-apply via action
+	// This mimics: kubectl annotate deployment test opendatahub.io/managed=true
+	obj2.SetAnnotations(map[string]string{
+		annotations.ManagedByODHOperator: "true",
+	})
+	rr.Resources = []unstructured.Unstructured{*obj2}
+	err = action(ctx, &rr)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	// Verify the action completes without error and annotation is set
+	err = cl.Get(ctx, client.ObjectKey{Namespace: ns, Name: deployName}, obj2)
+	g.Expect(err).ShouldNot(HaveOccurred())
+	g.Expect(obj2.GetAnnotations()).Should(HaveKeyWithValue(annotations.ManagedByODHOperator, "true"))
+
 }
 
 func TestDeployNotOwnedSkip(t *testing.T) {

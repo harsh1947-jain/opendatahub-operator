@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -443,7 +444,72 @@ func (a *Action) apply(
 		// - If the resource does not exist (the resource must be created)
 		// - If the resource is forcefully marked as managed by the operator via
 		//   annotations (i.e. to bring it back to the default values)
-		if old == nil || resources.GetAnnotation(old, annotations.ManagedByODHOperator) == "true" {
+		if old == nil {
+			break
+		}
+
+		if resources.GetAnnotation(old, annotations.ManagedByODHOperator) == "true" {
+			// When explicitly managed, force remove user-modified resources using Strategic Merge Patch.
+			// SSA cannot remove sub-fields owned by other field managers, so we must explicitly patch to null.
+
+			// Extract all containers from the existing deployment
+			containers, found, err := unstructured.NestedSlice(old.Object, "spec", "template", "spec", "containers")
+			if err != nil {
+				return nil, fmt.Errorf("failed to get containers from Deployment %s/%s: %w", obj.GetNamespace(), obj.GetName(), err)
+			}
+
+			// Build patch data for all containers dynamically
+			containerPatches := []map[string]interface{}{}
+			if found && len(containers) > 0 {
+				for _, container := range containers {
+					containerMap, ok := container.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					containerName, nameFound, _ := unstructured.NestedString(containerMap, "name")
+					if nameFound {
+						containerPatches = append(containerPatches, map[string]interface{}{
+							"name":      containerName,
+							"resources": nil,
+						})
+					}
+				}
+			}
+
+			// Get the replicas value from the operator's manifest (obj)
+			// This ensures we revert to the default specified in the manifest, not a hardcoded value
+			manifestReplicas, replicasFound, err := unstructured.NestedInt64(obj.Object, "spec", "replicas")
+			if err != nil {
+				return nil, fmt.Errorf("failed to get replicas from manifest for Deployment %s/%s: %w", obj.GetNamespace(), obj.GetName(), err)
+			}
+
+			patchData := map[string]interface{}{
+				"spec": map[string]interface{}{
+					"template": map[string]interface{}{
+						"spec": map[string]interface{}{
+							"containers": containerPatches,
+						},
+					},
+				},
+			}
+
+			// Only set replicas in patch if it exists in the manifest
+			if replicasFound {
+				if spec, ok := patchData["spec"].(map[string]interface{}); ok {
+					// Safe conversion from int64 to int32 with bounds checking
+					if manifestReplicas < math.MinInt32 || manifestReplicas > math.MaxInt32 {
+						return nil, fmt.Errorf("replica count %d out of int32 range for Deployment %s/%s", manifestReplicas, obj.GetNamespace(), obj.GetName())
+					}
+					spec["replicas"] = int32(manifestReplicas)
+				}
+			}
+			patchBytes, err := json.Marshal(patchData)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal patch data for Deployment %s/%s: %w", obj.GetNamespace(), obj.GetName(), err)
+			}
+			if err := cli.Patch(ctx, old, client.RawPatch(types.StrategicMergePatchType, patchBytes)); err != nil {
+				return nil, fmt.Errorf("failed to remove container resources from Deployment %s/%s: %w", obj.GetNamespace(), obj.GetName(), err)
+			}
 			break
 		}
 
