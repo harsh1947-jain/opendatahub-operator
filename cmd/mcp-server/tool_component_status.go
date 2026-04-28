@@ -3,13 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/clusterhealth"
+	"github.com/opendatahub-io/opendatahub-operator/pkg/clusterhealth"
 )
 
 // registerComponentStatus adds the component_status tool to the MCP server.
@@ -20,17 +24,46 @@ func registerComponentStatus(s *server.MCPServer, kubeClient client.Client) {
 		mcp.WithString("component", mcp.Required(),
 			mcp.Description("Component name, e.g. kserve, dashboard, workbenches")),
 		mcp.WithString("applications_namespace",
-			mcp.Description("Apps namespace. Default: opendatahub")),
+			mcp.Description("Apps namespace. Auto-discovered from DSCI if not provided. Returns an error if DSCI discovery fails due to RBAC or missing CRD. Falls back to E2E_TEST_APPLICATIONS_NAMESPACE env var or 'opendatahub'.")),
 	)
 
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		appsNS := stringParam(req, "applications_namespace", "")
+		if appsNS == "" {
+			var err error
+			appsNS, err = discoverAppsNamespace(ctx, kubeClient)
+			if err != nil {
+				switch {
+				case errors.Is(err, ErrDSCIRBACInsufficient):
+					return mcp.NewToolResultError("namespace discovery failed: RBAC insufficient"), nil
+				case errors.Is(err, ErrDSCICRDNotInstalled):
+					return mcp.NewToolResultError("namespace discovery failed: CRD not installed"), nil
+				default:
+					log.Printf("component_status: namespace discovery failed: %v", err)
+					return mcp.NewToolResultError("namespace discovery failed"), nil
+				}
+			}
+		}
+
 		result, err := clusterhealth.GetComponentStatus(ctx, kubeClient,
 			stringParam(req, "component", ""),
-			stringParam(req, "applications_namespace",
-				getEnvDefault(envApplicationsNamespace, defaultAppsNS)),
+			appsNS,
 		)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			component := stringParam(req, "component", "")
+			switch {
+			case k8serr.IsForbidden(err):
+				return mcp.NewToolResultError(fmt.Sprintf(
+					"RBAC insufficient: the operator service-account lacks permission to query component %q in namespace %q",
+					component, appsNS)), nil
+			case meta.IsNoMatchError(err):
+				return mcp.NewToolResultError(fmt.Sprintf(
+					"CRD not installed: component %q requires a CRD that is not registered on this cluster",
+					component)), nil
+			default:
+				log.Printf("component_status: failed to determine status for %q: %v", component, err)
+				return mcp.NewToolResultError(fmt.Sprintf("failed to determine component status for %q", component)), nil
+			}
 		}
 		data, err := json.MarshalIndent(result, "", "  ")
 		if err != nil {

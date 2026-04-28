@@ -3,14 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/clusterhealth"
+	"github.com/opendatahub-io/opendatahub-operator/pkg/clusterhealth"
 )
 
 // newFakeClient creates a controller-runtime fake client with core + apps schemes.
@@ -94,5 +96,150 @@ func TestPlatformHealth_NilClient(t *testing.T) {
 	_, err := clusterhealth.Run(context.Background(), clusterhealth.Config{})
 	if err == nil {
 		t.Error("Run(nil client) should return error")
+	}
+}
+
+func TestPlatformHealth_HandlerHappyPath(t *testing.T) {
+	cl := newFakeClient()
+	tests := []struct {
+		name string
+		args map[string]any
+		want []string
+	}{
+		{"empty arguments", map[string]any{}, nil},
+		{"explicit namespace overrides", map[string]any{
+			"operator_namespace":     "custom-op-ns",
+			"applications_namespace": "custom-apps-ns",
+			"sections":               "nodes,pods",
+		}, []string{"nodes", "pods"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := server.NewMCPServer("test", "0.0.1")
+			registerPlatformHealth(s, cl)
+			msg, err := json.Marshal(map[string]any{
+				"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+				"params": map[string]any{"name": "platform_health", "arguments": tt.args},
+			})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			raw, err := json.Marshal(s.HandleMessage(context.Background(), msg))
+			if err != nil {
+				t.Fatalf("marshal handler response: %v", err)
+			}
+			var rpc struct {
+				Result struct {
+					Content []struct{ Text string } `json:"content"`
+					IsError bool                    `json:"isError"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(raw, &rpc); err != nil {
+				t.Fatalf("unmarshal rpc: %v", err)
+			}
+			if len(rpc.Result.Content) == 0 {
+				t.Fatal("empty content")
+			}
+			if rpc.Result.IsError {
+				t.Fatalf("handler returned error: %s", rpc.Result.Content[0].Text)
+			}
+			var report clusterhealth.Report
+			if err := json.Unmarshal([]byte(rpc.Result.Content[0].Text), &report); err != nil {
+				t.Fatalf("unmarshal report: %v", err)
+			}
+			if report.CollectedAt.IsZero() {
+				t.Error("CollectedAt should be non-zero")
+			}
+			if tt.want != nil {
+				if len(report.SectionsRun) != len(tt.want) {
+					t.Fatalf("SectionsRun = %v, want %v", report.SectionsRun, tt.want)
+				}
+				want := make(map[string]bool, len(tt.want))
+				for _, s := range tt.want {
+					want[s] = true
+				}
+				for _, s := range report.SectionsRun {
+					if !want[s] {
+						t.Errorf("unexpected section %q", s)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestPlatformHealth_ErrorClients(t *testing.T) {
+	tests := []struct {
+		name      string
+		client    client.Client
+		args      map[string]any
+		wantInErr string
+	}{
+		{"RBAC forbidden", newForbiddenClient(), map[string]any{
+			"applications_namespace": "opendatahub",
+			"operator_namespace":     "opendatahub-operator-system",
+		}, "forbidden"},
+		{"CRD not installed", newNoMatchClient(), map[string]any{
+			"applications_namespace": "opendatahub",
+			"operator_namespace":     "opendatahub-operator-system",
+		}, "no matches for kind"},
+		{"namespace discovery failed", newForbiddenClient(), map[string]any{}, "namespace discovery failed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := server.NewMCPServer("test", "0.0.1")
+			registerPlatformHealth(s, tt.client)
+
+			msg, err := json.Marshal(map[string]any{
+				"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+				"params": map[string]any{"name": "platform_health", "arguments": tt.args},
+			})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			raw, err := json.Marshal(s.HandleMessage(context.Background(), msg))
+			if err != nil {
+				t.Fatalf("marshal handler response: %v", err)
+			}
+
+			var rpc struct {
+				Result struct {
+					Content []struct{ Text string } `json:"content"`
+					IsError bool                    `json:"isError"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(raw, &rpc); err != nil {
+				t.Fatalf("unmarshal rpc: %v", err)
+			}
+			if len(rpc.Result.Content) == 0 {
+				t.Fatal("empty content")
+			}
+
+			text := rpc.Result.Content[0].Text
+
+			if rpc.Result.IsError {
+				if !strings.Contains(text, tt.wantInErr) {
+					t.Errorf("error text=%q, want substring %q", text, tt.wantInErr)
+				}
+				return
+			}
+
+			var report clusterhealth.Report
+			if err := json.Unmarshal([]byte(text), &report); err != nil {
+				t.Fatalf("unmarshal report: %v", err)
+			}
+
+			for _, sec := range []struct{ name, err string }{
+				{"nodes", report.Nodes.Error},
+				{"pods", report.Pods.Error},
+				{"events", report.Events.Error},
+				{"operator", report.Operator.Error},
+			} {
+				if !strings.Contains(sec.err, tt.wantInErr) {
+					t.Errorf("section %s: error=%q, want substring %q", sec.name, sec.err, tt.wantInErr)
+				}
+			}
+		})
 	}
 }
