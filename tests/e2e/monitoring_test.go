@@ -99,10 +99,12 @@ func monitoringTestSuite(t *testing.T) {
 		expectedDefaultReplicas: expectedReplicas,
 	}
 
-	// Increase the global eventually timeout for monitoring tests involve complex operator dependencies (OpenTelemetry, Tempo, etc.)
-	// that can take longer to reconcile, especially under load or in slower environments.
-	reset := tc.OverrideEventuallyTimeout(tc.TestTimeouts.longEventuallyTimeout, tc.TestTimeouts.defaultEventuallyPollInterval)
-	defer reset() // Make sure it's reset after all tests run
+	// Set per-operation timeout defaults for monitoring tests that involve complex operator
+	// dependencies (OpenTelemetry, Tempo, etc.) that can take longer to reconcile.
+	tc.DefaultResourceOpts = []ResourceOpts{
+		WithEventuallyTimeout(tc.TestTimeouts.monitoringStackTimeout),
+		WithEventuallyPollingInterval(tc.TestTimeouts.defaultEventuallyPollInterval),
+	}
 
 	// ========================================================================
 	// Pre-requisite: Ensure required monitoring operators are installed
@@ -1181,7 +1183,11 @@ func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 	// Disable monitoring service
 	tc.resetMonitoringConfigToRemoved()
 
-	// Verify all monitoring-related resources are cleaned up
+	// Verify all monitoring-related resources are cleaned up.
+	// Use EnsureResourceGone (singular/Get-by-name) instead of EnsureResourcesGone
+	// (plural/namespace-wide List) because other controllers (e.g. MaaS) may create
+	// their own PersesDatasource resources in the same namespace. A List would pick
+	// those up and fail even though monitoring cleanup succeeded.
 	for _, resource := range []struct {
 		gvk  schema.GroupVersionKind
 		name string
@@ -1196,7 +1202,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 		{gvk.PersesDatasource, PersesDatasourceName},
 		{gvk.PersesDatasource, ClusterPrometheusDatasourceName},
 	} {
-		tc.EnsureResourcesGone(
+		tc.EnsureResourceGone(
 			WithMinimalObject(resource.gvk, types.NamespacedName{
 				Name:      resource.name,
 				Namespace: tc.MonitoringNamespace,
@@ -1335,7 +1341,7 @@ func (tc *MonitoringTestCtx) validateTempoStackCreationWithBackend(t *testing.T,
 				jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, status.ConditionTypeReady, metav1.ConditionTrue),
 			),
 		),
-		WithEventuallyTimeout(tc.TestTimeouts.longEventuallyTimeout),
+		WithEventuallyTimeout(tc.TestTimeouts.monitoringStackTimeout),
 		WithCustomErrorMsg("TempoStack should be created by controller with %s backend, but was not found or has incorrect backend type", backend),
 	)
 
@@ -1480,13 +1486,14 @@ func (tc *MonitoringTestCtx) cleanupGroup(t *testing.T, secretName string) {
 	)
 }
 
-// resetMonitoringConfigToManaged completely resets monitoring configuration and sets management state to Managed.
-// It waits for any in-flight deletions to complete to ensure clean state for the next test.
+// resetMonitoringConfigToManaged selectively deletes optional monitoring config fields and sets management state to Managed.
+// It preserves the immutable namespace field and waits for any in-flight deletions to complete to ensure clean state for the next test.
 func (tc *MonitoringTestCtx) resetMonitoringConfigToManaged() {
-	tc.updateMonitoringConfig(testf.Transform(`.spec.monitoring = {"managementState": "%s"}`, operatorv1.Managed))
+	tc.updateMonitoringConfig(
+		withManagementState(operatorv1.Managed),
+		testf.Transform(`del(.spec.monitoring.metrics, .spec.monitoring.traces, .spec.monitoring.alerting, .spec.monitoring.collectorReplicas)`),
+	)
 
-	// Wait for OpenTelemetryCollector to be deleted if it was running with metrics/traces
-	// The controller will delete it when monitoring is reset to empty config
 	tc.EnsureResourcesGone(
 		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
 			Name:      OpenTelemetryCollectorName,
@@ -1495,9 +1502,20 @@ func (tc *MonitoringTestCtx) resetMonitoringConfigToManaged() {
 	)
 }
 
-// resetMonitoringConfigToRemoved completely resets monitoring configuration and sets management state to Removed.
+// resetMonitoringConfigToRemoved resets monitoring configuration and sets management state to Removed.
+// It preserves the immutable namespace field while clearing all optional config fields.
 func (tc *MonitoringTestCtx) resetMonitoringConfigToRemoved() {
-	tc.updateMonitoringConfig(testf.Transform(`.spec.monitoring = {"managementState": "%s"}`, operatorv1.Removed))
+	tc.updateMonitoringConfig(
+		withManagementState(operatorv1.Removed),
+		testf.Transform(`del(.spec.monitoring.metrics, .spec.monitoring.traces, .spec.monitoring.alerting, .spec.monitoring.collectorReplicas)`),
+	)
+
+	tc.EnsureResourcesGone(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name:      OpenTelemetryCollectorName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+	)
 }
 
 // updateMonitoringConfig provides a flexible way to update DSCI monitoring configuration.
@@ -2175,7 +2193,7 @@ func (tc *MonitoringTestCtx) waitForPrometheusNamespaceProxyPrerequisites(t *tes
 			Namespace: namespace,
 		}),
 		WithCondition(jq.Match(`.status.conditions[] | select(.type == "Available") | .status == "True"`)),
-		WithEventuallyTimeout(tc.TestTimeouts.longEventuallyTimeout),
+		WithEventuallyTimeout(tc.TestTimeouts.monitoringStackTimeout),
 		WithCustomErrorMsg("MonitoringStack should be Available before prometheus-namespace-proxy deployment"),
 	)
 
@@ -2560,7 +2578,7 @@ func (tc *MonitoringTestCtx) validatePersesDatasourceTLSWithCloudBackend(t *test
 				jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, status.ConditionTypeReady, metav1.ConditionTrue),
 			),
 		),
-		WithEventuallyTimeout(tc.TestTimeouts.longEventuallyTimeout),
+		WithEventuallyTimeout(tc.TestTimeouts.monitoringStackTimeout),
 		WithCustomErrorMsg("TempoStack should be ready with %s backend before checking PersesDatasource", backend),
 	)
 
@@ -2584,7 +2602,7 @@ func (tc *MonitoringTestCtx) validatePersesDatasourceTLSWithCloudBackend(t *test
 				jq.Match(`.spec.config.plugin.spec.proxy.spec.secret == "tempo-datasource-secret"`),
 			),
 		),
-		WithEventuallyTimeout(tc.TestTimeouts.longEventuallyTimeout),
+		WithEventuallyTimeout(tc.TestTimeouts.monitoringStackTimeout),
 		WithCustomErrorMsg("PersesDatasource should have TLS enabled for %s backend", backend),
 	)
 

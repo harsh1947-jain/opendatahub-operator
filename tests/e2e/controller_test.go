@@ -104,6 +104,7 @@ type TestGroup struct {
 }
 
 type TestTimeouts struct {
+	// Generic tiers
 	defaultEventuallyTimeout        time.Duration
 	shortEventuallyTimeout          time.Duration
 	mediumEventuallyTimeout         time.Duration
@@ -111,6 +112,15 @@ type TestTimeouts struct {
 	defaultEventuallyPollInterval   time.Duration
 	defaultConsistentlyTimeout      time.Duration
 	defaultConsistentlyPollInterval time.Duration
+
+	// Named operation-specific tiers
+	crCreationTimeout         time.Duration // DSCI/DSC creation and readiness
+	componentReadinessTimeout time.Duration // Component enabled/disabled checks
+	monitoringStackTimeout    time.Duration // Monitoring stack readiness (Prometheus, Tempo, OLM-dependent)
+	authGatewayTimeout        time.Duration // Auth/gateway configuration checks
+	deletionRecoveryTimeout   time.Duration // Resource deletion and controller recreation
+	olmOperationTimeout       time.Duration // CSV succeeded, InstallPlan approval
+	operandReadinessTimeout   time.Duration // Operand deployments reaching ready state
 }
 
 type TestCase struct {
@@ -225,16 +235,11 @@ func (tg *TestGroup) Validate() error {
 	return nil
 }
 
-func (tg *TestGroup) Run(t *testing.T) {
-	t.Helper()
-
-	if !tg.enabled {
-		t.Skipf("Test group %s is disabled", tg.name)
-		return
-	}
-
+// resolveEnabledTests parses tg.flags into a set of test names that should
+// run. Flags without "!" are inclusions, flags prefixed with "!" are exclusions.
+func (tg *TestGroup) resolveEnabledTests() map[string]bool {
+	enabledTests := make(map[string]bool)
 	disabledTests := make([]string, 0)
-	enabledTests := make(map[string]bool, 0)
 
 	for _, name := range tg.flags {
 		if strings.HasPrefix(name, "!") {
@@ -244,19 +249,29 @@ func (tg *TestGroup) Run(t *testing.T) {
 		}
 	}
 
-	// Run all tests if none are explicitly enabled
 	if len(enabledTests) == 0 {
 		for _, name := range tg.Names() {
 			enabledTests[name] = true
 		}
 	}
 
-	// Remove disabled tests
 	for _, name := range disabledTests {
 		delete(enabledTests, name)
 	}
 
-	// Run each test case by group
+	return enabledTests
+}
+
+func (tg *TestGroup) Run(t *testing.T) {
+	t.Helper()
+
+	if !tg.enabled {
+		t.Skipf("Test group %s is disabled", tg.name)
+		return
+	}
+
+	enabledTests := tg.resolveEnabledTests()
+
 	for i, group := range tg.scenarios {
 		mustRun(t, fmt.Sprintf("group %d", i+1), func(t *testing.T) {
 			t.Helper()
@@ -280,6 +295,81 @@ func (tg *TestGroup) Run(t *testing.T) {
 	}
 }
 
+// RunSingle returns a test function that runs only the named test from this group.
+func (tg *TestGroup) RunSingle(name string) func(t *testing.T) {
+	return func(t *testing.T) {
+		t.Helper()
+
+		if !tg.enabled {
+			t.Skipf("Test group %s is disabled", tg.name)
+			return
+		}
+
+		if !tg.isTestEnabled(name) {
+			t.Skipf("Test %s is disabled by flags in group %s", name, tg.name)
+			return
+		}
+
+		for _, group := range tg.scenarios {
+			if testFunc, ok := group[name]; ok {
+				testFunc(t)
+				return
+			}
+		}
+
+		t.Skipf("Test %s not found in group %s", name, tg.name)
+	}
+}
+
+// isTestEnabled returns true if the named test should run given the group's flags.
+func (tg *TestGroup) isTestEnabled(name string) bool {
+	_, ok := tg.resolveEnabledTests()[name]
+	return ok
+}
+
+// RunExcluding returns a test function that runs this group but skips the
+// named test. Used together with RunSingle to split a test out of its group.
+func (tg *TestGroup) RunExcluding(excludeName string) func(t *testing.T) {
+	return func(t *testing.T) {
+		t.Helper()
+
+		if !tg.enabled {
+			t.Skipf("Test group %s is disabled", tg.name)
+			return
+		}
+
+		enabledTests := tg.resolveEnabledTests()
+		delete(enabledTests, excludeName)
+
+		if len(enabledTests) == 0 {
+			t.Skipf("No tests remaining in group %s after excluding %s", tg.name, excludeName)
+			return
+		}
+
+		for i, group := range tg.scenarios {
+			mustRun(t, fmt.Sprintf("group %d", i+1), func(t *testing.T) {
+				t.Helper()
+
+				groupNames := slices.AppendSeq(make([]string, 0, len(group)), maps.Keys(group))
+				slices.Sort(groupNames)
+
+				for _, testName := range groupNames {
+					testFunc := group[testName]
+					if _, ok := enabledTests[testName]; !ok {
+						t.Logf("Skipping tests for %s/%s", tg.name, testName)
+						continue
+					}
+					if tg.parallel {
+						mustRun(t, testName, testFunc, WithParallel())
+					} else {
+						mustRun(t, testName, testFunc)
+					}
+				}
+			})
+		}
+	}
+}
+
 // Helper function to handle cleanup logic.
 func handleCleanup(t *testing.T) {
 	t.Helper()
@@ -293,6 +383,9 @@ func handleCleanup(t *testing.T) {
 	})
 }
 
+// testDeadlineMargin is the safety margin subtracted from the go test -timeout deadline.
+const testDeadlineMargin = 5 * time.Minute
+
 // TestOdhOperator sets up the testing suite for the Operator.
 func TestOdhOperator(t *testing.T) {
 	// Set up global panic handler for comprehensive debugging
@@ -301,6 +394,25 @@ func TestOdhOperator(t *testing.T) {
 	registerSchemes()
 
 	log.SetLogger(zap.New(zap.UseDevMode(true)))
+
+	if deadline, ok := t.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining > testDeadlineMargin {
+			done := make(chan struct{})
+			watchdog := time.AfterFunc(remaining-testDeadlineMargin, func() {
+				select {
+				case <-done:
+					return
+				default:
+					t.Errorf("Internal timeout watchdog fired (%s before go test deadline) — marking test failed to trigger cleanup and preserve JUnit output", testDeadlineMargin)
+				}
+			})
+			t.Cleanup(func() {
+				close(done)
+				watchdog.Stop()
+			})
+		}
+	}
 
 	if testOpts.circuitBreakerEnabled {
 		healthChecker := NewClusterHealthChecker()
@@ -352,9 +464,14 @@ func TestOdhOperator(t *testing.T) {
 		mustRun(t, "DSCInitialization and DataScienceCluster validation E2E Tests", dscValidationTestSuite)
 	}
 
-	// Run components and services test suites
+	// Run monitoring before components — monitoring setup is a prerequisite.
+	mustRun(t, serviceApi.MonitoringServiceName, Services.RunSingle(serviceApi.MonitoringServiceName))
+
+	// Run components test suites
 	mustRun(t, Components.String(), Components.Run)
-	mustRun(t, Services.String(), Services.Run)
+
+	// Run remaining services (auth, gateway)
+	mustRun(t, Services.String(), Services.RunExcluding(serviceApi.MonitoringServiceName))
 
 	// Run operator resilience test suites after functional tests
 	if testOpts.operatorResilienceTest {
@@ -414,6 +531,7 @@ func TestMain(m *testing.M) {
 	// Defaults
 	// Gomega default values for Eventually/Consistently can be found here:
 	// https://onsi.github.io/gomega/#making-asynchronous-assertions
+	// Generic tiers
 	viper.SetDefault("defaultEventuallyTimeout", "5m")        // Timeout used for Eventually; overrides Gomega's default of 1 second.
 	viper.SetDefault("shortEventuallyTimeout", "10s")         // Timeout used for Eventually; overrides Gomega's default of 1 second.
 	viper.SetDefault("mediumEventuallyTimeout", "7m")         // Medium timeout: for readiness checks (e.g., ClusterServiceVersion, DataScienceCluster).
@@ -421,6 +539,15 @@ func TestMain(m *testing.M) {
 	viper.SetDefault("defaultEventuallyPollInterval", "10s")  // Polling interval for Eventually; overrides Gomega's default of 10 milliseconds.
 	viper.SetDefault("defaultConsistentlyTimeout", "20s")     // Duration used for Consistently; overrides Gomega's default of 2 seconds.
 	viper.SetDefault("defaultConsistentlyPollInterval", "5s") // Polling interval for Consistently; overrides Gomega's default of 50 milliseconds.
+
+	// Named operation-specific tiers — defaults based on CI observability data
+	viper.SetDefault("crCreationTimeout", "2m")         // DSCI/DSC creation and readiness (P99=71s, observed avg ~10s).
+	viper.SetDefault("componentReadinessTimeout", "3m") // Component enabled/disabled checks (P99=93s, outliers at 243s).
+	viper.SetDefault("monitoringStackTimeout", "7m")    // Monitoring stack readiness (P99=292s, TLS_Fix/ThanosQuerier pass at 5-6min).
+	viper.SetDefault("authGatewayTimeout", "5m")        // Auth/gateway checks (72 passes exceed 2min, max 265s — do not reduce).
+	viper.SetDefault("deletionRecoveryTimeout", "90s")  // Resource deletion and controller recreation (P99=46s, nothing above 90s).
+	viper.SetDefault("olmOperationTimeout", "2m")       // CSV succeeded, InstallPlan approval (P99=81s, nothing above 120s).
+	viper.SetDefault("operandReadinessTimeout", "2m")   // Operand deployments reaching ready state (P99=56s, outliers at 90s).
 
 	// Flags
 	pflag.String("operator-namespace", "opendatahub-operator-system", "Namespace where the odh operator is deployed")
@@ -493,6 +620,7 @@ func TestMain(m *testing.M) {
 	}
 
 	testOpts.TestTimeouts = TestTimeouts{
+		// Generic tiers
 		defaultEventuallyTimeout:        viper.GetDuration("defaultEventuallyTimeout"),
 		shortEventuallyTimeout:          viper.GetDuration("shortEventuallyTimeout"),
 		mediumEventuallyTimeout:         viper.GetDuration("mediumEventuallyTimeout"),
@@ -500,6 +628,14 @@ func TestMain(m *testing.M) {
 		defaultEventuallyPollInterval:   viper.GetDuration("defaultEventuallyPollInterval"),
 		defaultConsistentlyTimeout:      viper.GetDuration("defaultConsistentlyTimeout"),
 		defaultConsistentlyPollInterval: viper.GetDuration("defaultConsistentlyPollInterval"),
+		// Named operation-specific tiers
+		crCreationTimeout:         viper.GetDuration("crCreationTimeout"),
+		componentReadinessTimeout: viper.GetDuration("componentReadinessTimeout"),
+		monitoringStackTimeout:    viper.GetDuration("monitoringStackTimeout"),
+		authGatewayTimeout:        viper.GetDuration("authGatewayTimeout"),
+		deletionRecoveryTimeout:   viper.GetDuration("deletionRecoveryTimeout"),
+		olmOperationTimeout:       viper.GetDuration("olmOperationTimeout"),
+		operandReadinessTimeout:   viper.GetDuration("operandReadinessTimeout"),
 	}
 	testOpts.tag = viper.GetString("tag")
 	if !slices.Contains(allowedTags, TestTag(testOpts.tag)) {

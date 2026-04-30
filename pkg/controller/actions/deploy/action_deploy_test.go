@@ -1170,7 +1170,7 @@ func newOwnerRefReconciliationRequest(cl client.Client, instance *componentApi.D
 	}
 }
 
-func assertControllerOwnerRef(g Gomega, ownerRefs []metav1.OwnerReference, instance *componentApi.Dashboard, msgAndArgs ...interface{}) {
+func assertControllerOwnerRef(g Gomega, ownerRefs []metav1.OwnerReference, instance *componentApi.Dashboard, msgAndArgs ...any) {
 	g.Expect(ownerRefs).Should(HaveLen(1), msgAndArgs...)
 	g.Expect(ownerRefs[0].Kind).Should(Equal(gvk.Dashboard.Kind), msgAndArgs...)
 	g.Expect(ownerRefs[0].Name).Should(Equal(instance.Name), msgAndArgs...)
@@ -1603,7 +1603,19 @@ func TestWithApplyOrder(t *testing.T) {
 	})
 	g.Expect(err).ShouldNot(HaveOccurred())
 
-	// Input order: Deployment, Namespace (wrong order)
+	// Add cert-manager resources to test ordering
+	obj3, err := resources.ToUnstructured(&unstructured.Unstructured{})
+	obj3.SetGroupVersionKind(gvk.CertManagerCertificate)
+	obj3.SetNamespace("cert-manager")
+	obj3.SetName("test-cert")
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	obj4, err := resources.ToUnstructured(&unstructured.Unstructured{})
+	obj4.SetGroupVersionKind(gvk.CertManagerClusterIssuer)
+	obj4.SetName("test-issuer")
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	// Input order: Deployment, Namespace, Certificate, ClusterIssuer (wrong order)
 	rr := types.ReconciliationRequest{
 		Client: cl,
 		Instance: &componentApi.Dashboard{
@@ -1617,7 +1629,7 @@ func TestWithApplyOrder(t *testing.T) {
 				Major: 1, Minor: 2, Patch: 3,
 			}},
 		},
-		Resources: []unstructured.Unstructured{*obj1, *obj2},
+		Resources: []unstructured.Unstructured{*obj1, *obj2, *obj3, *obj4},
 		Controller: mocks.NewMockController(func(m *mocks.MockController) {
 			m.On("Owns", mock.Anything).Return(false)
 		}),
@@ -1626,14 +1638,234 @@ func TestWithApplyOrder(t *testing.T) {
 	err = action(ctx, &rr)
 	g.Expect(err).ShouldNot(HaveOccurred())
 
-	// Verify resources were reordered: Namespace before Deployment
+	// Verify resources were reordered correctly:
+	// RHOAIENG-53513: Certificate BEFORE Deployment to reduce transient errors
+	// Expected: Namespace → ClusterIssuer → Certificate → Deployment
+	g.Expect(rr.Resources).To(HaveLen(4))
 	g.Expect(rr.Resources[0].GetKind()).To(Equal(gvk.Namespace.Kind))
-	g.Expect(rr.Resources[1].GetKind()).To(Equal(gvk.Deployment.Kind))
+	g.Expect(rr.Resources[1].GetKind()).To(Equal(gvk.CertManagerClusterIssuer.Kind))
+	g.Expect(rr.Resources[2].GetKind()).To(Equal(gvk.CertManagerCertificate.Kind))
+	g.Expect(rr.Resources[3].GetKind()).To(Equal(gvk.Deployment.Kind))
 
-	// Verify both resources were deployed
+	// Verify all resources were deployed
 	err = cl.Get(ctx, apimachinery.NamespacedName{Namespace: ns, Name: "deploy-1"}, resources.GvkToUnstructured(gvk.Deployment))
 	g.Expect(err).ShouldNot(HaveOccurred())
 
 	err = cl.Get(ctx, apimachinery.NamespacedName{Name: obj2.GetName()}, resources.GvkToUnstructured(gvk.Namespace))
 	g.Expect(err).ShouldNot(HaveOccurred())
+
+	// Verify cert-manager resources were also deployed
+	err = cl.Get(ctx, apimachinery.NamespacedName{Namespace: "cert-manager", Name: "test-cert"}, resources.GvkToUnstructured(gvk.CertManagerCertificate))
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	err = cl.Get(ctx, apimachinery.NamespacedName{Name: obj4.GetName()}, resources.GvkToUnstructured(gvk.CertManagerClusterIssuer))
+	g.Expect(err).ShouldNot(HaveOccurred())
+}
+
+func TestDeployWithPartOfLabel(t *testing.T) {
+	g := NewWithT(t)
+
+	ctx := t.Context()
+	ns := xid.New().String()
+	customLabelKey := "custom.example.io/part-of"
+
+	cl, err := fakeclient.New()
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	action := deploy.NewAction(
+		deploy.WithMode(deploy.ModePatch),
+		deploy.WithPartOfLabel(customLabelKey),
+	)
+
+	obj1, err := resources.ToUnstructured(&appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: appsv1.SchemeGroupVersion.String(),
+			Kind:       "Deployment",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      xid.New().String(),
+			Namespace: ns,
+		},
+	})
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	rr := types.ReconciliationRequest{
+		Client: cl,
+		Instance: &componentApi.Dashboard{
+			ObjectMeta: metav1.ObjectMeta{
+				Generation: 1,
+			},
+		},
+		Release: common.Release{
+			Name: cluster.OpenDataHub,
+			Version: version.OperatorVersion{Version: semver.Version{
+				Major: 1, Minor: 2, Patch: 3,
+			}}},
+		Resources: []unstructured.Unstructured{*obj1},
+		Controller: mocks.NewMockController(func(m *mocks.MockController) {
+			m.On("Owns", mock.Anything).Return(false)
+		}),
+	}
+
+	err = action(ctx, &rr)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	err = cl.Get(ctx, client.ObjectKeyFromObject(obj1), obj1)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	g.Expect(obj1).Should(And(
+		jq.Match(`.metadata.labels."%s" == "%s"`, customLabelKey, strings.ToLower(componentApi.DashboardKind)),
+		Not(jq.Match(`.metadata.labels | has("%s")`, labels.PlatformPartOf)),
+	))
+}
+
+func TestDeployWithAnnotationPrefix(t *testing.T) {
+	g := NewWithT(t)
+
+	ctx := t.Context()
+	ns := xid.New().String()
+
+	cl, err := fakeclient.New()
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	action := deploy.NewAction(
+		deploy.WithMode(deploy.ModePatch),
+		deploy.WithAnnotationPrefix(labels.ODHInfrastructurePrefix),
+	)
+
+	obj1, err := resources.ToUnstructured(&appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: appsv1.SchemeGroupVersion.String(),
+			Kind:       "Deployment",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      xid.New().String(),
+			Namespace: ns,
+		},
+	})
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	rr := types.ReconciliationRequest{
+		Client: cl,
+		Instance: &componentApi.Dashboard{
+			ObjectMeta: metav1.ObjectMeta{
+				Generation: 1,
+			},
+		},
+		Release: common.Release{
+			Name: cluster.OpenDataHub,
+			Version: version.OperatorVersion{Version: semver.Version{
+				Major: 1, Minor: 2, Patch: 3,
+			}}},
+		Resources: []unstructured.Unstructured{*obj1},
+		Controller: mocks.NewMockController(func(m *mocks.MockController) {
+			m.On("Owns", mock.Anything).Return(false)
+		}),
+	}
+
+	err = action(ctx, &rr)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	err = cl.Get(ctx, client.ObjectKeyFromObject(obj1), obj1)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	g.Expect(obj1).Should(And(
+		jq.Match(`.metadata.annotations."%s" == "%s"`,
+			labels.ODHInfrastructurePrefix+annotations.SuffixInstanceGeneration,
+			strconv.FormatInt(rr.Instance.GetGeneration(), 10)),
+		jq.Match(`.metadata.annotations."%s" == "%s"`,
+			labels.ODHInfrastructurePrefix+annotations.SuffixInstanceName,
+			rr.Instance.GetName()),
+		jq.Match(`.metadata.annotations."%s" == "%s"`,
+			labels.ODHInfrastructurePrefix+annotations.SuffixInstanceUID,
+			string(rr.Instance.GetUID())),
+		jq.Match(`.metadata.annotations."%s" == "%s"`,
+			labels.ODHInfrastructurePrefix+annotations.SuffixType,
+			string(cluster.OpenDataHub)),
+		jq.Match(`.metadata.annotations."%s" == "%s"`,
+			labels.ODHInfrastructurePrefix+annotations.SuffixVersion,
+			"1.2.3"),
+		Not(jq.Match(`.metadata.annotations | has("%s")`, annotations.InstanceGeneration)),
+		Not(jq.Match(`.metadata.annotations | has("%s")`, annotations.PlatformType)),
+		Not(jq.Match(`.metadata.annotations | has("%s")`, annotations.PlatformVersion)),
+	))
+}
+
+func TestDeployCRDWithPartOfLabel(t *testing.T) {
+	g := NewWithT(t)
+
+	ctx := t.Context()
+	customLabelKey := "custom.example.io/part-of"
+
+	cl, err := fakeclient.New()
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	action := deploy.NewAction(
+		deploy.WithMode(deploy.ModePatch),
+		deploy.WithPartOfLabel(customLabelKey),
+	)
+
+	crd, err := resources.ToUnstructured(&apiextensionsv1.CustomResourceDefinition{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: apiextensionsv1.SchemeGroupVersion.String(),
+			Kind:       "CustomResourceDefinition",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "testresources.test.opendatahub.io",
+		},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Group: "test.opendatahub.io",
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
+				Kind:     "TestResource",
+				ListKind: "TestResourceList",
+				Plural:   "testresources",
+				Singular: "testresource",
+			},
+			Scope: apiextensionsv1.NamespaceScoped,
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
+				{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensionsv1.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+							Type: "object",
+						},
+					},
+				},
+			},
+		},
+	})
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	rr := types.ReconciliationRequest{
+		Client: cl,
+		Instance: &componentApi.Dashboard{
+			ObjectMeta: metav1.ObjectMeta{
+				Generation: 1,
+			},
+		},
+		Release: common.Release{
+			Name: cluster.OpenDataHub,
+			Version: version.OperatorVersion{Version: semver.Version{
+				Major: 1, Minor: 2, Patch: 3,
+			}},
+		},
+		Resources: []unstructured.Unstructured{*crd},
+		Controller: mocks.NewMockController(func(m *mocks.MockController) {
+			m.On("Owns", mock.Anything).Return(false)
+		}),
+	}
+
+	err = action(ctx, &rr)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	out := resources.GvkToUnstructured(gvk.CustomResourceDefinition)
+	err = cl.Get(ctx, apimachinery.NamespacedName{Name: crd.GetName()}, out)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	g.Expect(out).Should(And(
+		jq.Match(`.metadata.labels."%s" == "%s"`, customLabelKey, "dashboard"),
+		Not(jq.Match(`.metadata.labels | has("%s")`, labels.PlatformPartOf)),
+	))
 }

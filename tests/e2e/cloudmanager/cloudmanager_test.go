@@ -118,7 +118,10 @@ func TestCloudManager(t *testing.T) { //nolint:maintidx // sequential subtests s
 
 					wt.Get(gvk.Deployment, nn).Eventually().Should(And(
 						jq.Match(`.metadata.labels."%s" == "%s"`, labels.InfrastructurePartOf, partOfValue),
-						jq.Match(`.metadata.annotations."%s" == "%s"`, annotations.InstanceName, provider.InstanceName),
+						Not(jq.Match(`.metadata.labels | has("%s")`, labels.PlatformPartOf)),
+						jq.Match(`.metadata.annotations."%s" == "%s"`,
+							labels.ODHInfrastructurePrefix+annotations.SuffixInstanceName, provider.InstanceName),
+						Not(jq.Match(`.metadata.annotations | has("%s")`, annotations.InstanceName)),
 					))
 				})
 			}
@@ -387,8 +390,8 @@ func TestCloudManager(t *testing.T) { //nolint:maintidx // sequential subtests s
 				labels.InfrastructurePartOf: strings.ToLower(provider.GVK.Kind),
 			})
 			staleCM.SetAnnotations(map[string]string{
-				annotations.InstanceUID:        string(cr.GetUID()),
-				annotations.InstanceGeneration: "-1",
+				labels.ODHInfrastructurePrefix + annotations.SuffixInstanceUID:        string(cr.GetUID()),
+				labels.ODHInfrastructurePrefix + annotations.SuffixInstanceGeneration: "-1",
 			})
 			_ = unstructured.SetNestedSlice(staleCM.Object, []any{
 				map[string]any{
@@ -468,6 +471,17 @@ func TestCloudManager(t *testing.T) { //nolint:maintidx // sequential subtests s
 			)
 		}
 
+		// CertManager/cluster must exist and be owned by this CR.
+		wt.Get(gvk.CertManagerV1Alpha1, types.NamespacedName{Name: "cluster"}).
+			Eventually().Should(jq.Match(`.metadata.ownerReferences | length > 0`))
+
+		// cert-manager operand Deployments must be running before we delete the CR.
+		for _, dep := range certManagerOperandDeployments {
+			wt.Get(gvk.Deployment, types.NamespacedName{
+				Name: dep.Name, Namespace: dep.Namespace,
+			}).Eventually().Should(Not(BeNil()))
+		}
+
 		// Namespaces are excluded from dynamic ownership to prevent cascade
 		// deletion of the entire namespace (and all third-party resources in it)
 		// when the CR is deleted. Verify they have no owner references.
@@ -484,6 +498,20 @@ func TestCloudManager(t *testing.T) { //nolint:maintidx // sequential subtests s
 
 		// All owned deployments should be cascade-deleted via owner references.
 		for _, dep := range managedDependencyDeployments {
+			wt.Get(gvk.Deployment, types.NamespacedName{
+				Name: dep.Name, Namespace: dep.Namespace,
+			}).Eventually().Should(BeNil())
+		}
+
+		// CertManager/cluster CR must be deleted. The finalizer action deletes it
+		// to allow cert-manager-operator to clean up its own resources.
+		wt.Get(gvk.CertManagerV1Alpha1, types.NamespacedName{Name: "cluster"}).
+			Eventually().Should(BeNil())
+
+		// cert-manager operand Deployments must be removed by the cert-manager-operator
+		// finalizer. They are not directly owned by our CR, so cascade deletion
+		// does not cover them.
+		for _, dep := range certManagerOperandDeployments {
 			wt.Get(gvk.Deployment, types.NamespacedName{
 				Name: dep.Name, Namespace: dep.Namespace,
 			}).Eventually().Should(BeNil())
